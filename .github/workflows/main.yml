@@ -511,7 +511,7 @@ jobs:
       - name: Build debug APK
         run: gradle assembleDebug --no-daemon --stacktrace
 
-            - name: Upload the APK
+      - name: Upload the APK
         uses: actions/upload-artifact@v4
         with:
           name: boxbreath-apk
