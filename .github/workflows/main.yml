@@ -117,6 +117,7 @@ jobs:
           import android.content.Intent
           import android.content.pm.PackageManager
           import android.graphics.Color
+          import android.media.AudioAttributes
           import android.os.Build
           import android.os.Bundle
           import android.os.Handler
@@ -226,9 +227,11 @@ jobs:
 
                   private fun notifyUi() = Handler(Looper.getMainLooper()).post { listener?.invoke() }
 
-                  /** Label shown while the test sequence is playing, or null. */
-                  @Volatile
-                  var testLabel: String? = null
+                  /** ALARM usage so the system treats these as cues, not decorative haptics. */
+                  val ALARM_ATTRS: AudioAttributes = AudioAttributes.Builder()
+                      .setUsage(AudioAttributes.USAGE_ALARM)
+                      .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                      .build()
               }
 
               private val handler = Handler(Looper.getMainLooper())
@@ -286,12 +289,12 @@ jobs:
                   endAtUptime =
                       if (totalMinutes > 0) SystemClock.uptimeMillis() + totalMinutes * 60_000L else 0L
 
-                  // Three quick taps say "starting" — distinct from any phase cue.
-                  buzz(longArrayOf(0, 120, 120, 120, 120, 120))
+                  // Three quick taps say "starting", held back so the Start button's own
+                  // touch feedback has finished before they play.
+                  handler.postDelayed({ buzz(longArrayOf(0, 120, 120, 120, 120, 120)) }, 500L)
 
-                  // The first phase begins a beat later, so its cue doesn't blur into the
-                  // start signal. Fire it through the same path the rest of the cycle uses.
-                  nextStepAt = SystemClock.uptimeMillis() + 1200L
+                  // The first phase begins well clear of the start signal.
+                  nextStepAt = SystemClock.uptimeMillis() + 2200L
                   handler.postAtTime(tick, nextStepAt)
                   notifyUi()
               }
@@ -353,9 +356,27 @@ jobs:
                */
               fun buzz(timings: LongArray) {
                   try {
-                      vibrator.vibrate(VibrationEffect.createWaveform(timings, -1))
+                      // A single pulse is a one-shot, not a waveform with a leading zero:
+                      // some actuators mishandle that form and play nothing at all.
+                      val effect = if (timings.size == 2) {
+                          VibrationEffect.createOneShot(timings[1], VibrationEffect.DEFAULT_AMPLITUDE)
+                      } else {
+                          VibrationEffect.createWaveform(timings, -1)
+                      }
+                      vibrator.vibrate(effect, ALARM_ATTRS)
                   } catch (e: Exception) {
                       // A missing or busy vibrator must never take the session down.
+                  }
+              }
+
+              /** What this device actually reports, so we stop guessing. */
+              fun diagnostics(): String {
+                  return try {
+                      "API " + Build.VERSION.SDK_INT +
+                          "  ·  vibrator " + (if (vibrator.hasVibrator()) "yes" else "NO") +
+                          "  ·  amplitude " + (if (vibrator.hasAmplitudeControl()) "yes" else "no")
+                  } catch (e: Exception) {
+                      "vibrator unavailable: " + e.javaClass.simpleName
                   }
               }
 
@@ -425,6 +446,9 @@ jobs:
           }
 
           class MainActivity : Activity() {
+
+              /** A detached service instance, used only to reach the vibrator helpers. */
+              private val probe = BreathService()
 
               private val lengthOptions = listOf(5, 10, 15, 0)
               private var patternIndex = 0
@@ -514,6 +538,7 @@ jobs:
                   }
                   testBtn.setOnClickListener { runCueTest() }
 
+                  probe.attachFor(this)
                   BreathService.listener = { render() }
                   render()
               }
@@ -534,21 +559,23 @@ jobs:
                */
               private fun runCueTest() {
                   if (BreathService.running) return
-                  val svc = BreathService()
+                  val svc = probe
                   val seq = listOf(
                       Phase.INHALE to "Breathe in",
                       Phase.EXHALE to "Breathe out",
                       Phase.HOLD_FULL to "Hold"
                   )
+                  svc.attachFor(this)
                   seq.forEachIndexed { i, (phase, name) ->
+                      // 900ms lead-in: a cue fired immediately is swallowed by the
+                      // button's own touch feedback on most phones.
                       startBtn.postDelayed({
                           phaseLabel.text = name
-                          cycleLabel.text = "Test " + (i + 1) + " of 3"
-                          svc.attachFor(this)
+                          cycleLabel.text = "Test " + (i + 1) + " of " + seq.size
                           svc.cue(phase)
-                      }, i * 2200L)
+                      }, 900L + i * 2500L)
                   }
-                  startBtn.postDelayed({ render() }, seq.size * 2200L + 800L)
+                  startBtn.postDelayed({ render() }, 900L + seq.size * 2500L)
               }
 
               private fun startSession() {
@@ -584,12 +611,13 @@ jobs:
                   val len = lengthOptions[lengthIndex]
                   lengthBtn.text = if (len == 0) "Until I stop" else "$len minutes"
 
-                  legend.text = if (p.steps.size == 2) {
+                  val cues = if (p.steps.size == 2) {
                       "One long buzz - breathe in\nTwo buzzes - breathe out"
                   } else {
                       "One long buzz - breathe in\nOne tap - hold\n" +
                               "Two buzzes - breathe out\nOne tap - hold"
                   }
+                  legend.text = cues + "\n\n" + probe.diagnostics()
 
                   if (on) {
                       phaseLabel.text = BreathService.currentPhase.label
