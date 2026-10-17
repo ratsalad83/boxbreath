@@ -225,6 +225,10 @@ jobs:
                   var listener: (() -> Unit)? = null
 
                   private fun notifyUi() = Handler(Looper.getMainLooper()).post { listener?.invoke() }
+
+                  /** Label shown while the test sequence is playing, or null. */
+                  @Volatile
+                  var testLabel: String? = null
               }
 
               private val handler = Handler(Looper.getMainLooper())
@@ -234,14 +238,20 @@ jobs:
               private var endAtUptime = 0L
               private var nextStepAt = 0L
 
-              private val vibrator: Vibrator by lazy {
-                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                      (getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as VibratorManager).defaultVibrator
+              private val vibrator: Vibrator
+                  get() = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                      (ctx().getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as VibratorManager).defaultVibrator
                   } else {
                       @Suppress("DEPRECATION")
-                      getSystemService(Context.VIBRATOR_SERVICE) as Vibrator
+                      ctx().getSystemService(Context.VIBRATOR_SERVICE) as Vibrator
                   }
-              }
+
+              private var testContext: Context? = null
+
+              /** Lets the Activity borrow the cue player without starting a session. */
+              fun attachFor(ctx: Context) { testContext = ctx }
+
+              private fun ctx(): Context = testContext ?: this
 
               override fun onBind(intent: Intent?): IBinder? = null
 
@@ -277,7 +287,7 @@ jobs:
                       if (totalMinutes > 0) SystemClock.uptimeMillis() + totalMinutes * 60_000L else 0L
 
                   // Three quick taps say "starting" — distinct from any phase cue.
-                  vibratePattern(longArrayOf(0, 70, 90, 70, 90, 70), intArrayOf(0, 180, 0, 180, 0, 180))
+                  buzz(longArrayOf(0, 120, 120, 120, 120, 120))
 
                   // The first phase begins a beat later, so its cue doesn't blur into the
                   // start signal. Fire it through the same path the rest of the cycle uses.
@@ -297,7 +307,7 @@ jobs:
                       if (!running) return
 
                       if (endAtUptime != 0L && SystemClock.uptimeMillis() >= endAtUptime) {
-                          vibratePattern(longArrayOf(0, 500, 200, 500), intArrayOf(0, 255, 0, 255))
+                          buzz(longArrayOf(0, 600, 250, 600))
                           handler.postDelayed({ stopEverything() }, 1400)
                           return
                       }
@@ -328,22 +338,22 @@ jobs:
                * The cues differ in shape, not just length, and the holds are long enough
                * to actually register — 90ms was below the threshold on most phones.
                */
-              private fun cue(phase: Phase) = when (phase) {
-                  Phase.INHALE -> vibratePattern(longArrayOf(0, 700), intArrayOf(0, 255))
-                  Phase.EXHALE -> vibratePattern(longArrayOf(0, 260, 150, 260), intArrayOf(0, 230, 0, 230))
-                  Phase.HOLD_FULL -> vibratePattern(longArrayOf(0, 140), intArrayOf(0, 190))
-                  Phase.HOLD_EMPTY -> vibratePattern(longArrayOf(0, 140), intArrayOf(0, 190))
+              fun cue(phase: Phase) = when (phase) {
+                  Phase.INHALE -> buzz(longArrayOf(0, 800))
+                  Phase.EXHALE -> buzz(longArrayOf(0, 400, 250, 400))
+                  Phase.HOLD_FULL -> buzz(longArrayOf(0, 200))
+                  Phase.HOLD_EMPTY -> buzz(longArrayOf(0, 200))
               }
 
-              private fun vibratePattern(timings: LongArray, amplitudes: IntArray) {
+              /**
+               * Timing-only waveform at full strength. The amplitude-controlled variant was
+               * dropping the shorter pulses on some actuators, so the double-buzz was never
+               * felt; this path is the most widely supported one. Odd entries are ON,
+               * starting from index 1.
+               */
+              fun buzz(timings: LongArray) {
                   try {
-                      vibrator.cancel()
-                      val effect = if (vibrator.hasAmplitudeControl()) {
-                          VibrationEffect.createWaveform(timings, amplitudes, -1)
-                      } else {
-                          VibrationEffect.createWaveform(timings, -1)
-                      }
-                      vibrator.vibrate(effect)
+                      vibrator.vibrate(VibrationEffect.createWaveform(timings, -1))
                   } catch (e: Exception) {
                       // A missing or busy vibrator must never take the session down.
                   }
@@ -425,6 +435,7 @@ jobs:
               private lateinit var startBtn: Button
               private lateinit var patternBtn: Button
               private lateinit var lengthBtn: Button
+              private lateinit var testBtn: Button
               private lateinit var legend: TextView
 
               private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
@@ -474,6 +485,12 @@ jobs:
                   lengthBtn.setBackgroundColor(Color.TRANSPARENT)
                   root.addView(lengthBtn, LinearLayout.LayoutParams(match, wrap))
 
+                  testBtn = Button(this)
+                  testBtn.setTextColor(MUTED)
+                  testBtn.setBackgroundColor(Color.TRANSPARENT)
+                  testBtn.text = "Test the cues"
+                  root.addView(testBtn, LinearLayout.LayoutParams(match, wrap))
+
                   legend = TextView(this)
                   legend.textSize = 13f
                   legend.setTextColor(MUTED)
@@ -495,6 +512,7 @@ jobs:
                       lengthIndex = (lengthIndex + 1) % lengthOptions.size
                       render()
                   }
+                  testBtn.setOnClickListener { runCueTest() }
 
                   BreathService.listener = { render() }
                   render()
@@ -508,6 +526,29 @@ jobs:
               override fun onDestroy() {
                   BreathService.listener = null
                   super.onDestroy()
+              }
+
+              /**
+               * Plays each cue in turn with its name on screen, so a cue that the phone
+               * fails to render is obvious without starting a whole session.
+               */
+              private fun runCueTest() {
+                  if (BreathService.running) return
+                  val svc = BreathService()
+                  val seq = listOf(
+                      Phase.INHALE to "Breathe in",
+                      Phase.EXHALE to "Breathe out",
+                      Phase.HOLD_FULL to "Hold"
+                  )
+                  seq.forEachIndexed { i, (phase, name) ->
+                      startBtn.postDelayed({
+                          phaseLabel.text = name
+                          cycleLabel.text = "Test " + (i + 1) + " of 3"
+                          svc.attachFor(this)
+                          svc.cue(phase)
+                      }, i * 2200L)
+                  }
+                  startBtn.postDelayed({ render() }, seq.size * 2200L + 800L)
               }
 
               private fun startSession() {
@@ -591,4 +632,4 @@ jobs:
           gh release create apk \
             app/build/outputs/apk/debug/app-debug.apk \
             --title 'Box Breath APK' \
-            --notes 'Tap app-debug.apk below to install on your phone.' 
+            --notes 'Tap app-debug.apk below to install on your phone.'
